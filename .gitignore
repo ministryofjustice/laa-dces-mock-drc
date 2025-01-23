@@ -1,0 +1,12 @@
+
+**/.idea
+**/[Bb]in/
+**/[Oo]bj/
+**/[Pp]ackages/
+**/_UpgradeReport_Files/
+
+.DS_Store
+.env
+*.suo
+*.user
+*.http
