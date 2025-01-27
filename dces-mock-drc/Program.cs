@@ -3,6 +3,7 @@ using System.Security.Claims;
 using System.Security.Cryptography.X509Certificates;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Azure.Identity;
 using JetBrains.Annotations;
 using Microsoft.AspNetCore.Authentication.Certificate;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
@@ -11,23 +12,33 @@ using Microsoft.AspNetCore.Http.HttpResults;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.Server.Kestrel.Core;
 using Microsoft.AspNetCore.Server.Kestrel.Https;
+using Microsoft.Extensions.Azure;
 using Microsoft.Extensions.Logging;
 
 var builder = WebApplication.CreateBuilder(args);
 
-//builder.Logging.AddConsole();
-//builder.Logging.AddAzureWebAppDiagnostics();
-
-// Configure Kestrel Web Server for client certificates.
-builder.Services.Configure<KestrelServerOptions>(serverOptions =>
+if (builder.Environment.IsDevelopment())
 {
-    serverOptions.ConfigureHttpsDefaults(options =>
+    // Configure Kestrel Web Server for client certificates.
+    builder.Services.Configure<KestrelServerOptions>(serverOptions =>
     {
-        // RequireCertificate works fine.
-        options.ClientCertificateMode = ClientCertificateMode.DelayCertificate;
-        options.AllowAnyClientCertificate(); // Server disconnects client without this.
+        serverOptions.ConfigureHttpsDefaults(options =>
+        {
+            // RequireCertificate works fine.
+            options.ClientCertificateMode = ClientCertificateMode.DelayCertificate;
+            options.AllowAnyClientCertificate(); // Server disconnects client without this.
+        });
     });
-});
+}
+else
+{
+    var vaultUri = builder.Configuration["KeyVault:VaultUri"];
+    if (!string.IsNullOrEmpty(vaultUri))
+    {
+        builder.Configuration.AddAzureKeyVault(new Uri(vaultUri), new DefaultAzureCredential());
+    }
+    builder.Logging.AddAzureWebAppDiagnostics();
+}
 
 // Configure JSON serialization to allow object reference cycles to be ignored (else ClaimsPrincipal won't serialize).
 builder.Services.Configure<Microsoft.AspNetCore.Http.Json.JsonOptions>(options =>
@@ -80,15 +91,16 @@ var fdcReqCountByStatus = new ConcurrentDictionary<String, int>();
 
 app.MapGet("/laa/v1/stats", () =>
 {
+    app.Logger.LogInformation("KeyVault:VaultUri = {}, Alpha:Beta = {}", app.Configuration["KeyVault:VaultUri"], app.Configuration["Alpha:Beta"]);
     app.Logger.LogInformation("stats request received; responding concorStoredCount:{}, fdcStoredCount:{}",
         concorContributions.Count, fdcContributions.Count);
-    return new
+    return Results.Ok(new
     {
         concorStoredCount = concorContributions.Count,
         fdcStoredCount = fdcContributions.Count,
         concorRequestCounts = concorReqCountByStatus,
         fdcRequestCounts = fdcReqCountByStatus
-    };
+    });
 });//.RequireAuthorization();
 
 app.MapPost("/laa/v1/contribution", ([FromBody] ConcorContributionReqRoot body) =>
@@ -143,7 +155,7 @@ app.MapPost("/laa/v1/fdc", ([FromBody] FdcReqRoot body) =>
 
 app.Run();
 
-// DTOs for JSON requests
+// DTOs for JSON request bodies
 [UsedImplicitly] record ConcorContributionReqObj(int MaatId, String Flag);
 [UsedImplicitly] record ConcorContributionReqData(int ConcorContributionId, ConcorContributionReqObj ConcorContributionObj);
 record ConcorContributionReqRoot([UsedImplicitly] ConcorContributionReqData Data, JsonElement Meta);
