@@ -4,7 +4,7 @@
         <TargetFramework>net8.0</TargetFramework>
         <Nullable>enable</Nullable>
         <ImplicitUsings>enable</ImplicitUsings>
-        <RootNamespace>dces_mock_drc</RootNamespace>
+        <RootNamespace>JusticeGovUk.LaaDcesMockDrc</RootNamespace>
         <UserSecretsId>0f31917d-e903-4ac3-a780-21b8a529628a</UserSecretsId>
     </PropertyGroup>
 

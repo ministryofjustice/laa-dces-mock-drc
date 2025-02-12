@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Security.Claims;
 using System.Security.Cryptography.X509Certificates;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Azure;
@@ -15,6 +16,9 @@ using Microsoft.AspNetCore.Server.Kestrel.Core;
 using Microsoft.AspNetCore.Server.Kestrel.Https;
 using Microsoft.Extensions.Azure;
 using Microsoft.Extensions.Logging;
+using Microsoft.IdentityModel.Tokens;
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -45,27 +49,37 @@ else
 builder.Services.Configure<Microsoft.AspNetCore.Http.Json.JsonOptions>(options =>
     options.SerializerOptions.ReferenceHandler = ReferenceHandler.IgnoreCycles);
 
-/*builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme) // JwtBearer is the "default" auth scheme.
-    .AddJwtBearer()
-    .AddCertificate(options =>
+builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme) // JwtBearer is the "default" auth scheme.
+    .AddJwtBearer(options =>
+    {
+        var issuer = builder.Configuration["Jwt:Issuer"];
+        var signingKey = builder.Configuration["Jwt:SigningKey"];
+        options.TokenValidationParameters = new TokenValidationParameters
+        {
+            ValidateAudience = false,
+            ValidIssuer = issuer,
+            IssuerSigningKey = new SymmetricSecurityKey(Convert.FromBase64String(signingKey ?? ""))
+        };
+    })
+    /*.AddCertificate(options =>
     {   // `options.AllowedCertificateTypes = CertificateTypes.Chained` by default.
         options.ChainTrustValidationMode = X509ChainTrustMode.CustomRootTrust;
         options.CustomTrustStore.Add(X509Certificate2.CreateFromPem(
-            File.ReadAllText("cert/ca.crt").AsSpan()));
-        // `/var/ssl/certs/ca.der` in filesystem on Azure?
+            builder.Configuration["Client-CA"].AsSpan()));
+        // What about `/var/ssl/certs/ca.der` in filesystem on Azure ?
         options.RevocationMode = X509RevocationMode.NoCheck;
-    });*/
+    })*/;
 
-/*builder.Services.AddAuthorization(options =>
+builder.Services.AddAuthorization(options =>
 {
-    options.DefaultPolicy = new AuthorizationPolicyBuilder(JwtBearerDefaults.AuthenticationScheme,
-            CertificateAuthenticationDefaults.AuthenticationScheme)
+    options.DefaultPolicy = new AuthorizationPolicyBuilder(JwtBearerDefaults.AuthenticationScheme/*,
+            CertificateAuthenticationDefaults.AuthenticationScheme*/)
         // Check that both authentication schemes provided an authenticated identity (could look for a claim from each).
         .RequireAssertion(
             context => context.User.Identities.Count() == options.DefaultPolicy.AuthenticationSchemes.Count &&
                        context.User.Identities.All(identity => identity.IsAuthenticated))
         .Build();
-});*/
+});
 
 var app = builder.Build();
 
@@ -75,8 +89,18 @@ app.Use(next => context =>
     return next(context);
 });
 
-//app.UseAuthentication();
-//app.UseAuthorization();
+app.UseAuthentication();
+app.UseAuthorization();
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Keep track of data received.
+int devDrcId = 11, devConcorCount = 0, devFdcCount = 0; // increment on valid stores
+var devIdToStatus = new ConcurrentDictionary<int, int>();
+devIdToStatus.TryAdd(13, 400);
+var devPostedRequests = new List<PostedRequest>();
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 // Simple JSON endpoints.
 app.MapGet("/who-am-i", (ClaimsPrincipal user) =>
@@ -87,28 +111,68 @@ app.MapGet("/who-am-i", (ClaimsPrincipal user) =>
     {
         User = user
     };
-});//.RequireAuthorization();
+}).RequireAuthorization();
 
-// Keep track of data received.
-int devDrcId = 11, devConcorCount = 0, devFdcCount = 0; // increment on valid stores
-var devIdToStatus = new ConcurrentDictionary<int, int>();
-var devPostedRequests = new List<PostedRequest>();
-
-devIdToStatus.TryAdd(13, 400);
+app.MapPost("/setup", (List<IdToStatus> mapping) =>
+{
+    foreach (IdToStatus entry in mapping)
+    {
+        if (entry.Id == -1) devIdToStatus.Clear();
+        devIdToStatus.AddOrUpdate(entry.Id, entry.StatusCode, (id, oldValue) => entry.StatusCode);
+    }
+    return Results.Ok(new
+    {
+        mapping = devIdToStatus
+    });
+}).RequireAuthorization();
 
 app.MapGet("/data", () =>
 {
-    if (devPostedRequests.Count > 350)
-    {
-        devPostedRequests.RemoveRange(0, devPostedRequests.Count-350);
-    }
+    if (devPostedRequests.Count > 350) devPostedRequests.RemoveRange(0, devPostedRequests.Count-350);
     return Results.Ok(new
     {
         concorCount = devConcorCount,
         fdcCount = devFdcCount,
         postedRequests = devPostedRequests,
     });
-});//.RequireAuthorization();
+}).RequireAuthorization();
+
+app.MapPost("/laa/v1/contribution", async (HttpRequest request, [FromBody] ConcorContributionReqRoot body) =>
+{
+    // Do we have a "preplanned" response? If not, respond 200 this time, and add 409 as next response:
+    if (devIdToStatus.TryAdd(body.Data.ConcorContributionId, 200))
+    {
+        app.Logger.LogInformation("Contribution payload received {}; no predetermined state", body);
+        return await HandlePostedRequest(request, "Contribution", body.Data.ConcorContributionId, 200);
+    }
+    else
+    {
+        int currentState = devIdToStatus[body.Data.ConcorContributionId];
+        app.Logger.LogInformation("ConcorContribution payload received {}; state {}", body, currentState);
+        return await HandlePostedRequest(request, "Contribution", body.Data.ConcorContributionId, currentState);
+    }
+}).RequireAuthorization();
+
+app.MapPost("/laa/v1/fdc", async (HttpRequest request, [FromBody] FdcReqRoot body) =>
+{
+    // Do we have a "preplanned" response? If not, respond 200 this time, and add 409 as next response:
+    if (devIdToStatus.TryAdd(body.Data.FdcId, 200))
+    {
+        app.Logger.LogInformation("Fdc payload received {}; no predetermined state", body);
+        return await HandlePostedRequest(request, "Fdc", body.Data.FdcId, 200);
+    }
+    else
+    {
+        int currentState = devIdToStatus[body.Data.FdcId];
+        app.Logger.LogInformation("Fdc payload received {}; state {}", body, currentState);
+        return await HandlePostedRequest(request, "Fdc", body.Data.FdcId, currentState);
+    }
+}).RequireAuthorization();
+
+app.Run();
+return;
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 async Task<IResult> HandlePostedRequest(HttpRequest request, string entity, int id, int currentState)
 {
@@ -120,7 +184,7 @@ async Task<IResult> HandlePostedRequest(HttpRequest request, string entity, int 
     {
         case 200:
             devPostedRequests.Add(new PostedRequest(DateTime.Now, request.Path, id,  rawRequestBody, currentState, "OK with drcId", entity));
-            bool inc = devIdToStatus.TryUpdate(id, 409, currentState);
+            bool inc = devIdToStatus.TryUpdate(id, 634, currentState);
             if ("Fdc".Equals(entity))
             {
                 if (inc) Interlocked.Increment(ref devFdcCount);
@@ -137,9 +201,9 @@ async Task<IResult> HandlePostedRequest(HttpRequest request, string entity, int 
             }
         case 635:
             devPostedRequests.Add(new PostedRequest(DateTime.Now, request.Path, id, rawRequestBody, 200, "OK without drcId", entity));
-            devIdToStatus.TryUpdate(id, 409, currentState);
+            devIdToStatus.TryUpdate(id, 634, currentState);
             return Results.Ok();
-        case 409:
+        case 634:
             devPostedRequests.Add(new PostedRequest(DateTime.Now, request.Path, id, rawRequestBody, currentState, "Conflict with duplicate-id", ""));
             return Results.Problem(
                 $"The {entity} [{id}] already exists in the database",
@@ -156,48 +220,26 @@ async Task<IResult> HandlePostedRequest(HttpRequest request, string entity, int 
                 $"Validation failed in some unspecified way",
                 request.Path,
                 currentState);
+        case 404:
+            devPostedRequests.Add(new PostedRequest(DateTime.Now, request.Path, id, rawRequestBody, currentState, "Bad Request with problemDetail", ""));
+            return Results.Problem(
+                $"Not found in some unspecified way",
+                request.Path,
+                currentState);
+        case 409:
+            devPostedRequests.Add(new PostedRequest(DateTime.Now, request.Path, id, rawRequestBody, currentState, "Bad Request with problemDetail", ""));
+            return Results.Problem(
+                $"Conflict in some unspecified way",
+                request.Path,
+                currentState);
         default:
             devPostedRequests.Add(new PostedRequest(DateTime.Now, request.Path, id, rawRequestBody, 500, "Internal Server Error with problemDetails", ""));
             return Results.Problem(
-                $"statusCode {currentState}",
+                $"Responding with statusCode {currentState}",
                 request.Path,
                 500);
     }
 }
-
-app.MapPost("/laa/v1/contribution", async (HttpRequest request, [FromBody] ConcorContributionReqRoot body) =>
-{
-    // Do we have a "preplanned" response? If not, respond 200 this time, and add 409 as next response:
-    if (devIdToStatus.TryAdd(body.Data.ConcorContributionId, 200))
-    {
-        app.Logger.LogInformation("Contribution payload received {}; no predetermined state", body);
-        return await HandlePostedRequest(request, "Contribution", body.Data.ConcorContributionId, 200);
-    }
-    else
-    {
-        int currentState = devIdToStatus[body.Data.ConcorContributionId];
-        app.Logger.LogInformation("ConcorContribution payload received {}; state {}", body, currentState);
-        return await HandlePostedRequest(request, "Contribution", body.Data.ConcorContributionId, currentState);
-    }
-});//.RequireAuthorization();
-
-app.MapPost("/laa/v1/fdc", async (HttpRequest request, [FromBody] FdcReqRoot body) =>
-{
-    // Do we have a "preplanned" response? If not, respond 200 this time, and add 409 as next response:
-    if (devIdToStatus.TryAdd(body.Data.FdcId, 200))
-    {
-        app.Logger.LogInformation("Fdc payload received {}; no predetermined state", body);
-        return await HandlePostedRequest(request, "Fdc", body.Data.FdcId, 200);
-    }
-    else
-    {
-        int currentState = devIdToStatus[body.Data.FdcId];
-        app.Logger.LogInformation("Fdc payload received {}; state {}", body, currentState);
-        return await HandlePostedRequest(request, "Fdc", body.Data.FdcId, currentState);
-    }
-});//.RequireAuthorization();
-
-app.Run();
 
 // We keep a list of the last N requests
 [UsedImplicitly] record PostedRequest(
@@ -210,10 +252,10 @@ app.Run();
     string StoredType);
 
 // DTOs for JSON request bodies
+[UsedImplicitly] record IdToStatus(int Id, int StatusCode);
 [UsedImplicitly] record ConcorContributionReqObj(int MaatId, String Flag);
 [UsedImplicitly] record ConcorContributionReqData(int ConcorContributionId, ConcorContributionReqObj ConcorContributionObj);
 [UsedImplicitly] record ConcorContributionReqRoot(ConcorContributionReqData Data, JsonElement Meta);
-
 [UsedImplicitly] record FdcReqObj(long MaatId);
 [UsedImplicitly] record FdcReqData(int FdcId, FdcReqObj FdcObj);
 [UsedImplicitly] record FdcReqRoot(FdcReqData Data, JsonElement Meta);

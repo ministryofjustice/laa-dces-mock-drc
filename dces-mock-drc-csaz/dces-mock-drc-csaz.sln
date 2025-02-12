@@ -1,6 +1,6 @@
 ﻿
 Microsoft Visual Studio Solution File, Format Version 12.00
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "dces-mock-drc", "dces-mock-drc.csproj", "{8C851ECD-0A31-42D2-A918-D5F9CF21E373}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "dces-mock-drc-csaz", "dces-mock-drc-csaz.csproj", "{8C851ECD-0A31-42D2-A918-D5F9CF21E373}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution

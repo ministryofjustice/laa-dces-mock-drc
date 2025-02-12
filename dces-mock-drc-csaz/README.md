@@ -1,4 +1,4 @@
-# `dces-mock-drc API`
+# `dces-mock-drc-csaz API`
 
 ## Azure configuration
 
@@ -10,9 +10,9 @@
 4. Created an app service called `laadces-mock-drc` (implicitly created an app service plan, or could have been the
    resource group? Anyway, the ASP is Linux, Basic (B1))
 5. In the app service's **Settings** / **Configuration** / **General settings** tab, I set
-   - **Minimum Inbound TLS Version** to _1.3_
-   - **Minimum Inbound TLS Cipher** to _TLS_RSA_WITH_AES_128_GCM_SHA256_
-   - **Client certificate mode** to _Allow_
+   - _(optional)_ **Minimum Inbound TLS Version** to _1.3_
+   - _(optional)_ **Minimum Inbound TLS Cipher** to _TLS_RSA_WITH_AES_128_GCM_SHA256_
+   - _(required for mTLS)_ **Client certificate mode** to _Allow_
 6. In the app service's **Settings** / **Identity** / **System assigned** tab, I set
    - **Status** to _On_, and made a note of the **Object (principal) ID**.
 7. Created a key vault with name `kv-laadces-mock-drc`. Added myself and Aminur with role 'Key Vault Administrator'.
