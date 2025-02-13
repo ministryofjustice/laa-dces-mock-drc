@@ -107,66 +107,43 @@ app.MapGet("/who-am-i", (ClaimsPrincipal user) =>
 {
     app.Logger.LogInformation("WhoAmI request received, responding 200 OK: {}",
         String.Join(", ", user.Identities.Select(identity => identity.Name)));
-    return new
-    {
-        User = user
-    };
+    return new { User = user };
 }).RequireAuthorization();
 
-app.MapPost("/setup", (List<IdToStatus> mapping) =>
+app.MapDelete("/setup", () => devIdToStatus.Clear()).RequireAuthorization();
+app.MapGet("/setup", () => new
 {
-    foreach (IdToStatus entry in mapping)
+    data = devIdToStatus.Select(kvp => new IdToStatus(kvp.Key, kvp.Value)).ToList()
+}).RequireAuthorization();
+app.MapPost("/setup", ([FromBody] SetupRoot body) =>
+{
+    foreach (var idToStatus in body.Data)
     {
-        if (entry.Id == -1) devIdToStatus.Clear();
-        devIdToStatus.AddOrUpdate(entry.Id, entry.StatusCode, (id, oldValue) => entry.StatusCode);
+        devIdToStatus.AddOrUpdate(idToStatus.Id, idToStatus.StatusCode, (_, _) => idToStatus.StatusCode);
     }
-    return Results.Ok(new
-    {
-        mapping = devIdToStatus
-    });
+    return Results.Created();
 }).RequireAuthorization();
 
-app.MapGet("/data", () =>
+app.MapDelete("/requests", () => devPostedRequests.Clear()).RequireAuthorization();
+app.MapGet("/requests", () => new
 {
-    if (devPostedRequests.Count > 350) devPostedRequests.RemoveRange(0, devPostedRequests.Count-350);
-    return Results.Ok(new
-    {
-        concorCount = devConcorCount,
-        fdcCount = devFdcCount,
-        postedRequests = devPostedRequests,
-    });
+    data = devPostedRequests
 }).RequireAuthorization();
 
 app.MapPost("/laa/v1/contribution", async (HttpRequest request, [FromBody] ConcorContributionReqRoot body) =>
 {
-    // Do we have a "preplanned" response? If not, respond 200 this time, and add 409 as next response:
-    if (devIdToStatus.TryAdd(body.Data.ConcorContributionId, 200))
-    {
-        app.Logger.LogInformation("Contribution payload received {}; no predetermined state", body);
-        return await HandlePostedRequest(request, "Contribution", body.Data.ConcorContributionId, 200);
-    }
-    else
-    {
-        int currentState = devIdToStatus[body.Data.ConcorContributionId];
-        app.Logger.LogInformation("ConcorContribution payload received {}; state {}", body, currentState);
-        return await HandlePostedRequest(request, "Contribution", body.Data.ConcorContributionId, currentState);
-    }
+    var statusCode = devIdToStatus.TryAdd(body.Data.ConcorContributionId, 200)
+        ? 200
+        : devIdToStatus[body.Data.ConcorContributionId];
+    return await HandlePostedRequest(request, body.Data.ConcorContributionId, statusCode, "Contribution");
 }).RequireAuthorization();
 
 app.MapPost("/laa/v1/fdc", async (HttpRequest request, [FromBody] FdcReqRoot body) =>
 {
-    // Do we have a "preplanned" response? If not, respond 200 this time, and add 409 as next response:
-    if (devIdToStatus.TryAdd(body.Data.FdcId, 200))
-    {
-        app.Logger.LogInformation("Fdc payload received {}; no predetermined state", body);
-        return await HandlePostedRequest(request, "Fdc", body.Data.FdcId, 200);
-    }
-    else
-    {
-        int currentState = devIdToStatus[body.Data.FdcId];
-        app.Logger.LogInformation("Fdc payload received {}; state {}", body, currentState);
-        return await HandlePostedRequest(request, "Fdc", body.Data.FdcId, currentState);
-    }
+    var statusCode = devIdToStatus.TryAdd(body.Data.FdcId, 200)
+        ? 200
+        : devIdToStatus[body.Data.FdcId];
+    return await HandlePostedRequest(request, body.Data.FdcId, statusCode, "Fdc");
 }).RequireAuthorization();
 
 app.Run();
@@ -174,18 +151,24 @@ return;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-async Task<IResult> HandlePostedRequest(HttpRequest request, string entity, int id, int currentState)
+async Task Record(HttpRequest request, int id, int statusCode, string responseType, string storedType)
 {
+    var requestPath = request.Path.Value;
     request.Body.Position = 0;
-    var rawRequestBody = await new StreamReader(request.Body).ReadToEndAsync();
-    app.Logger.LogInformation("Contribution request received: {}", rawRequestBody);
+    var requestBody = await new StreamReader(request.Body).ReadToEndAsync();
+    app.Logger.LogInformation("POST {} : `{}`", requestPath, requestBody);
+    devPostedRequests.Add(new PostedRequest(DateTime.Now, requestPath ?? "", id, requestBody, statusCode, responseType, storedType));
+    if (devPostedRequests.Count > 1000) devPostedRequests.RemoveRange(0, devPostedRequests.Count - 1000);
+}
 
-    switch (currentState)
+async Task<IResult> HandlePostedRequest(HttpRequest request, int id, int statusCode, string storedType)
+{
+    switch (statusCode)
     {
         case 200:
-            devPostedRequests.Add(new PostedRequest(DateTime.Now, request.Path, id,  rawRequestBody, currentState, "OK with drcId", entity));
-            bool inc = devIdToStatus.TryUpdate(id, 634, currentState);
-            if ("Fdc".Equals(entity))
+            await Record(request, id, statusCode, "OK (meta,200)", storedType);
+            bool inc = devIdToStatus.TryUpdate(id, 634, statusCode);
+            if ("Fdc".Equals(storedType))
             {
                 if (inc) Interlocked.Increment(ref devFdcCount);
                 return Results.Ok(new { meta = new {
@@ -199,43 +182,39 @@ async Task<IResult> HandlePostedRequest(HttpRequest request, string entity, int 
                         drcId = Interlocked.Increment(ref devDrcId),
                         concorContributionId = id } });
             }
-        case 635:
-            devPostedRequests.Add(new PostedRequest(DateTime.Now, request.Path, id, rawRequestBody, 200, "OK without drcId", entity));
-            devIdToStatus.TryUpdate(id, 634, currentState);
-            return Results.Ok();
-        case 634:
-            devPostedRequests.Add(new PostedRequest(DateTime.Now, request.Path, id, rawRequestBody, currentState, "Conflict with duplicate-id", ""));
-            return Results.Problem(
-                $"The {entity} [{id}] already exists in the database",
-                request.Path,
-                currentState,
-                "Conflict",
-                "https://laa-debt-collection.service.justice.gov.uk/problem-types#duplicate-id");
-        case 659:
-            devPostedRequests.Add(new PostedRequest(DateTime.Now, request.Path, id, rawRequestBody, 409, "Conflict without duplicate-id", entity));
-            return Results.Conflict();
         case 400:
-            devPostedRequests.Add(new PostedRequest(DateTime.Now, request.Path, id, rawRequestBody, currentState, "Bad Request with problemDetail", ""));
+            await Record(request, id, statusCode, "Bad Request (ProblemDetail,400)", "");
             return Results.Problem(
                 $"Validation failed in some unspecified way",
                 request.Path,
-                currentState);
+                statusCode);
         case 404:
-            devPostedRequests.Add(new PostedRequest(DateTime.Now, request.Path, id, rawRequestBody, currentState, "Bad Request with problemDetail", ""));
+            await Record(request, id, statusCode, "Not Found (ProblemDetail,404)", "");;
             return Results.Problem(
                 $"Not found in some unspecified way",
                 request.Path,
-                currentState);
+                statusCode);
         case 409:
-            devPostedRequests.Add(new PostedRequest(DateTime.Now, request.Path, id, rawRequestBody, currentState, "Bad Request with problemDetail", ""));
+            await Record(request, id, statusCode, "Conflict (ProblemDetail,409)", "");
             return Results.Problem(
                 $"Conflict in some unspecified way",
                 request.Path,
-                currentState);
-        default:
-            devPostedRequests.Add(new PostedRequest(DateTime.Now, request.Path, id, rawRequestBody, 500, "Internal Server Error with problemDetails", ""));
+                statusCode);
+        case 634: // special 409 that is actually a success (has special "type" in response body).
+            await Record(request, id, statusCode, "Conflict (duplicate-id,634)", "");
             return Results.Problem(
-                $"Responding with statusCode {currentState}",
+                $"The {storedType} [{id}] already exists in the database",
+                request.Path,
+                statusCode,
+                "Conflict",
+                "https://laa-debt-collection.service.justice.gov.uk/problem-types#duplicate-id");
+        case 635: // special 200 that is actually a failure (has empty response body).
+            await Record(request, id, 200, "OK (empty,635)", storedType);
+            return Results.Ok();
+        default:
+            await Record(request, id, 500, $"Internal Server Error (ProblemDetail,{statusCode})", "");
+            return Results.Problem(
+                $"Internal server error in some unspecified way ({statusCode})",
                 request.Path,
                 500);
     }
@@ -253,6 +232,7 @@ async Task<IResult> HandlePostedRequest(HttpRequest request, string entity, int 
 
 // DTOs for JSON request bodies
 [UsedImplicitly] record IdToStatus(int Id, int StatusCode);
+[UsedImplicitly] record SetupRoot(List<IdToStatus> Data);
 [UsedImplicitly] record ConcorContributionReqObj(int MaatId, String Flag);
 [UsedImplicitly] record ConcorContributionReqData(int ConcorContributionId, ConcorContributionReqObj ConcorContributionObj);
 [UsedImplicitly] record ConcorContributionReqRoot(ConcorContributionReqData Data, JsonElement Meta);
