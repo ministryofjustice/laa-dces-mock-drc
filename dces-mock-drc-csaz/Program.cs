@@ -49,17 +49,15 @@ else
 builder.Services.Configure<Microsoft.AspNetCore.Http.Json.JsonOptions>(options =>
     options.SerializerOptions.ReferenceHandler = ReferenceHandler.IgnoreCycles);
 
+var clientId = builder.Configuration["Authentication:AzureAd:ClientId"];
+var tenantId = builder.Configuration["Authentication:AzureAd:TenantId"];
+//var clientCa = builder.Configuration["Authentication:Certificate:ClientCa"];
+
 builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme) // JwtBearer is the "default" auth scheme.
     .AddJwtBearer(options =>
     {
-        var issuer = builder.Configuration["Jwt:Issuer"];
-        var signingKey = builder.Configuration["Jwt:SigningKey"];
-        options.TokenValidationParameters = new TokenValidationParameters
-        {
-            ValidateAudience = false,
-            ValidIssuer = issuer,
-            IssuerSigningKey = new SymmetricSecurityKey(Convert.FromBase64String(signingKey ?? ""))
-        };
+        options.Audience = clientId;
+        options.Authority = $"https://login.microsoftonline.com/{tenantId}/v2.0";
     })
     /*.AddCertificate(options =>
     {   // `options.AllowedCertificateTypes = CertificateTypes.Chained` by default.
@@ -97,7 +95,6 @@ app.UseAuthorization();
 // Keep track of data received.
 int devDrcId = 11, devConcorCount = 0, devFdcCount = 0; // increment on valid stores
 var devIdToStatus = new ConcurrentDictionary<int, int>();
-devIdToStatus.TryAdd(13, 400);
 var devPostedRequests = new List<PostedRequest>();
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -189,7 +186,7 @@ async Task<IResult> HandlePostedRequest(HttpRequest request, int id, int statusC
                 request.Path,
                 statusCode);
         case 404:
-            await Record(request, id, statusCode, "Not Found (ProblemDetail,404)", "");;
+            await Record(request, id, statusCode, "Not Found (ProblemDetail,404)", "");
             return Results.Problem(
                 $"Not found in some unspecified way",
                 request.Path,
