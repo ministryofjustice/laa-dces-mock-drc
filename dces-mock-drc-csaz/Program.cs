@@ -30,7 +30,7 @@ if (builder.Environment.IsDevelopment())
         serverOptions.ConfigureHttpsDefaults(options =>
         {
             // RequireCertificate works fine.
-            options.ClientCertificateMode = ClientCertificateMode.DelayCertificate;
+            options.ClientCertificateMode = ClientCertificateMode.RequireCertificate;
             options.AllowAnyClientCertificate(); // Server disconnects client without this.
         });
     });
@@ -51,7 +51,9 @@ builder.Services.Configure<Microsoft.AspNetCore.Http.Json.JsonOptions>(options =
 
 var clientId = builder.Configuration["Authentication:AzureAd:ClientId"];
 var tenantId = builder.Configuration["Authentication:AzureAd:TenantId"];
-//var clientCa = builder.Configuration["Authentication:Certificate:ClientCa"];
+var clientCa = builder.Configuration["Authentication:Certificate:ClientCa"];
+
+builder.Services.AddCertificateForwarding(options => options.CertificateHeader = "X-ARR-ClientCert");
 
 builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme) // JwtBearer is the "default" auth scheme.
     .AddJwtBearer(options =>
@@ -59,23 +61,22 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme) // Jw
         options.Audience = clientId;
         options.Authority = $"https://login.microsoftonline.com/{tenantId}/v2.0";
     })
-    /*.AddCertificate(options =>
+    .AddCertificate(options =>
     {   // `options.AllowedCertificateTypes = CertificateTypes.Chained` by default.
         options.ChainTrustValidationMode = X509ChainTrustMode.CustomRootTrust;
-        options.CustomTrustStore.Add(X509Certificate2.CreateFromPem(
-            builder.Configuration["Client-CA"].AsSpan()));
-        // What about `/var/ssl/certs/ca.der` in filesystem on Azure ?
+        options.CustomTrustStore.Add(X509Certificate2.CreateFromPem(clientCa.AsSpan()));
         options.RevocationMode = X509RevocationMode.NoCheck;
-    })*/;
+    });
 
 builder.Services.AddAuthorization(options =>
 {
-    options.DefaultPolicy = new AuthorizationPolicyBuilder(JwtBearerDefaults.AuthenticationScheme/*,
-            CertificateAuthenticationDefaults.AuthenticationScheme*/)
+    options.DefaultPolicy = new AuthorizationPolicyBuilder(
+            JwtBearerDefaults.AuthenticationScheme,
+            CertificateAuthenticationDefaults.AuthenticationScheme)
         // Check that both authentication schemes provided an authenticated identity (could look for a claim from each).
-        .RequireAssertion(
-            context => context.User.Identities.Count() == options.DefaultPolicy.AuthenticationSchemes.Count &&
-                       context.User.Identities.All(identity => identity.IsAuthenticated))
+        .RequireAssertion(context =>
+            context.User.Identities.Count() == options.DefaultPolicy.AuthenticationSchemes.Count
+            && context.User.Identities.All(identity => identity.IsAuthenticated))
         .Build();
 });
 
@@ -87,15 +88,16 @@ app.Use(next => context =>
     return next(context);
 });
 
+app.UseCertificateForwarding();
 app.UseAuthentication();
 app.UseAuthorization();
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 // Keep track of data received.
-int devDrcId = 11, devConcorCount = 0, devFdcCount = 0; // increment on valid stores
-var devIdToStatus = new ConcurrentDictionary<int, int>();
-var devPostedRequests = new List<PostedRequest>();
+int dataDrcId = 11, dataConcorCount = 0, dataFdcCount = 0; // increment on valid stores
+var dataIdToStatus = new ConcurrentDictionary<int, int>();
+var dataPostedRequests = new List<PostedRequest>();
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -107,39 +109,39 @@ app.MapGet("/who-am-i", (ClaimsPrincipal user) =>
     return new { User = user };
 }).RequireAuthorization();
 
-app.MapDelete("/setup", () => devIdToStatus.Clear()).RequireAuthorization();
+app.MapDelete("/setup", () => dataIdToStatus.Clear()).RequireAuthorization();
 app.MapGet("/setup", () => new
 {
-    data = devIdToStatus.Select(kvp => new IdToStatus(kvp.Key, kvp.Value)).ToList()
+    data = dataIdToStatus.Select(kvp => new IdToStatus(kvp.Key, kvp.Value)).ToList()
 }).RequireAuthorization();
 app.MapPost("/setup", ([FromBody] SetupRoot body) =>
 {
     foreach (var idToStatus in body.Data)
     {
-        devIdToStatus.AddOrUpdate(idToStatus.Id, idToStatus.StatusCode, (_, _) => idToStatus.StatusCode);
+        dataIdToStatus.AddOrUpdate(idToStatus.Id, idToStatus.StatusCode, (_, _) => idToStatus.StatusCode);
     }
     return Results.Created();
 }).RequireAuthorization();
 
-app.MapDelete("/requests", () => devPostedRequests.Clear()).RequireAuthorization();
+app.MapDelete("/requests", () => dataPostedRequests.Clear()).RequireAuthorization();
 app.MapGet("/requests", () => new
 {
-    data = devPostedRequests
+    data = dataPostedRequests
 }).RequireAuthorization();
 
 app.MapPost("/laa/v1/contribution", async (HttpRequest request, [FromBody] ConcorContributionReqRoot body) =>
 {
-    var statusCode = devIdToStatus.TryAdd(body.Data.ConcorContributionId, 200)
+    var statusCode = dataIdToStatus.TryAdd(body.Data.ConcorContributionId, 200)
         ? 200
-        : devIdToStatus[body.Data.ConcorContributionId];
+        : dataIdToStatus[body.Data.ConcorContributionId];
     return await HandlePostedRequest(request, body.Data.ConcorContributionId, statusCode, "Contribution");
 }).RequireAuthorization();
 
 app.MapPost("/laa/v1/fdc", async (HttpRequest request, [FromBody] FdcReqRoot body) =>
 {
-    var statusCode = devIdToStatus.TryAdd(body.Data.FdcId, 200)
+    var statusCode = dataIdToStatus.TryAdd(body.Data.FdcId, 200)
         ? 200
-        : devIdToStatus[body.Data.FdcId];
+        : dataIdToStatus[body.Data.FdcId];
     return await HandlePostedRequest(request, body.Data.FdcId, statusCode, "Fdc");
 }).RequireAuthorization();
 
@@ -154,8 +156,8 @@ async Task Record(HttpRequest request, int id, int statusCode, string responseTy
     request.Body.Position = 0;
     var requestBody = await new StreamReader(request.Body).ReadToEndAsync();
     app.Logger.LogInformation("POST {} : `{}`", requestPath, requestBody);
-    devPostedRequests.Add(new PostedRequest(DateTime.Now, requestPath ?? "", id, requestBody, statusCode, responseType, storedType));
-    if (devPostedRequests.Count > 1000) devPostedRequests.RemoveRange(0, devPostedRequests.Count - 1000);
+    dataPostedRequests.Add(new PostedRequest(DateTime.Now, requestPath ?? "", id, requestBody, statusCode, responseType, storedType));
+    if (dataPostedRequests.Count > 1000) dataPostedRequests.RemoveRange(0, dataPostedRequests.Count - 1000);
 }
 
 async Task<IResult> HandlePostedRequest(HttpRequest request, int id, int statusCode, string storedType)
@@ -164,19 +166,19 @@ async Task<IResult> HandlePostedRequest(HttpRequest request, int id, int statusC
     {
         case 200:
             await Record(request, id, statusCode, "OK (meta,200)", storedType);
-            bool inc = devIdToStatus.TryUpdate(id, 634, statusCode);
+            bool inc = dataIdToStatus.TryUpdate(id, 634, statusCode);
             if ("Fdc".Equals(storedType))
             {
-                if (inc) Interlocked.Increment(ref devFdcCount);
+                if (inc) Interlocked.Increment(ref dataFdcCount);
                 return Results.Ok(new { meta = new {
-                        drcId = Interlocked.Increment(ref devDrcId),
+                        drcId = Interlocked.Increment(ref dataDrcId),
                         fdcId = id } });
             }
             else
             {
-                if (inc) Interlocked.Increment(ref devConcorCount);
+                if (inc) Interlocked.Increment(ref dataConcorCount);
                 return Results.Ok(new { meta = new {
-                        drcId = Interlocked.Increment(ref devDrcId),
+                        drcId = Interlocked.Increment(ref dataDrcId),
                         concorContributionId = id } });
             }
         case 400:
