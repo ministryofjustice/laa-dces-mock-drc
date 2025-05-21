@@ -155,9 +155,41 @@ async Task Record(HttpRequest request, int id, int statusCode, string responseTy
     var requestPath = request.Path.Value;
     request.Body.Position = 0;
     var requestBody = await new StreamReader(request.Body).ReadToEndAsync();
-    app.Logger.LogInformation("POST {} : `{}`", requestPath, requestBody);
+    app.Logger.LogInformation("POST {} : `{}`", requestPath, SafeForLog(requestBody));
     dataPostedRequests.Add(new PostedRequest(DateTime.Now, requestPath ?? "", id, requestBody, statusCode, responseType, storedType));
     if (dataPostedRequests.Count > 1000) dataPostedRequests.RemoveRange(0, dataPostedRequests.Count - 1000);
+}
+
+// Sanitize user input
+string SafeForLog(string input)
+{
+    const int maxLogLength = 1000;
+    var sanitized = new StringBuilder();
+    foreach (char c in input)
+    {
+        if (sanitized.Length >= maxLogLength)
+        {
+            sanitized.Append("...[truncated]");
+            break;
+        }
+        if (c == '\n')
+        {
+            sanitized.Append("\\n");
+        }
+        else if (c == '\r')
+        {
+            sanitized.Append("\\r");
+        }
+        else if (c < 32 || c > 126)
+        {
+            sanitized.Append($"\\u{(int)c:X4}");
+        }
+        else
+        {
+            sanitized.Append(c);
+        }
+    }
+    return sanitized.ToString();
 }
 
 async Task<IResult> HandlePostedRequest(HttpRequest request, int id, int statusCode, string storedType)
